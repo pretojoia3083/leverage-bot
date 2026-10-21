@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: leverage-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_backtest.py
+    envVars:
+      # As credenciais NAO ficam aqui. Configure no painel do Render:
+      # Dashboard -> leverage-bot -> Environment -> Add Environment Variable
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false

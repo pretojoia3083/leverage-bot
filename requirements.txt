@@ -1,0 +1,6 @@
+python-telegram-bot>=20.0
+python-dotenv
+exnovaapi @ git+https://github.com/CassDs/exnovaapi.git
+httpx
+requests
+websocket-client
