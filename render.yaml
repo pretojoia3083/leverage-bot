@@ -14,3 +14,8 @@ services:
         sync: false
       - key: MONGO_URI
         sync: false
+      # IA (opcional). Se deixar vazio, o bot roda sem IA (modo regras).
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
