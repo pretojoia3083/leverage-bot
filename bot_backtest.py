@@ -12,6 +12,17 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
+# Motor de geracao de sinais (analise multi-indicador + multi-timeframe)
+from signal_engine import (
+    to_candles, generate_signal, analyze_multi_timeframe,
+    parse_signal_line, parse_signal_list,
+    detect_scan_request, detect_generic_signal_request,
+    TF_SECONDS,
+)
+
+# Assistente de IA (opcional - so ativa se houver OPENAI_API_KEY no .env)
+import ai_assistant
+
 os.environ['SSL_CERT_FILE'] = ''
 
 # Stats globais por usuario
@@ -785,6 +796,184 @@ class CopyTrader:
         )
 
 # ============================================================
+# ANALISE / SCANNER DE ATIVOS (multi-timeframe)
+# ============================================================
+
+# Ativos mais usados, mostrados como botoes
+POPULAR_ACTIVES = [
+    "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC",
+    "EURJPY-OTC", "EURGBP-OTC", "GBPJPY-OTC",
+    "AUDUSD-OTC", "USDCAD-OTC",
+    "BTCUSD-OTC", "XAUUSD-OTC",
+]
+
+# Timeframes analisados e expiracao automatica (minutos)
+ANALYSIS_TFS = ("M1", "M5", "M15")
+TF_EXPIRY = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60}
+
+
+def fetch_candles_multi(api, active, tfs=ANALYSIS_TFS, count=250):
+    """Puxa velas do ativo em varios timeframes. Retorna {tf: [Candle]}."""
+    out = {}
+    end = int(time.time())
+    for tf in tfs:
+        size = TF_SECONDS.get(tf, 60)
+        try:
+            raw = api.get_candles(active, size, count, end)
+            out[tf] = to_candles(raw)
+        except Exception as e:
+            log.warning("Erro velas %s %s: %s", active, tf, e)
+            out[tf] = []
+    return out
+
+
+_actives_cache = {"ts": 0, "set": set()}
+
+
+def _load_op_code():
+    """Carrega o modulo OP_code da exnovaapi, tolerando variacoes de versao."""
+    for caminho in ("exnovaapi.stable_api", "exnovaapi.constants", "exnovaapi"):
+        try:
+            mod = __import__(caminho, fromlist=["OP_code"])
+            op = getattr(mod, "OP_code", None)
+            if op is not None and hasattr(op, "ACTIVES"):
+                return op
+        except Exception:
+            continue
+    return None
+
+
+def OP_code_actives():
+    """Lista de ativos validos da Exnova (com cache de 1h)."""
+    now = time.time()
+    if _actives_cache["set"] and now - _actives_cache["ts"] < 3600:
+        return _actives_cache["set"]
+    try:
+        op = _load_op_code()
+        if op:
+            _actives_cache["set"] = set(op.ACTIVES.keys())
+            _actives_cache["ts"] = now
+    except Exception as e:
+        log.warning("Nao consegui listar ativos: %s", e)
+    return _actives_cache["set"]
+
+
+def render_analysis(res) -> str:
+    """Monta a mensagem de analise para o usuario."""
+    header = f"🧠 *ANÁLISE — {res.active}*\n━━━━━━━━━━━━━━━━━━"
+
+    if res.news_blocked:
+        return (f"{header}\n\n"
+                f"🚫 *BLOQUEADO — {res.news_reason}*\n\n"
+                f"⚠️ Evite operar perto de notícias de alto impacto.")
+
+    lines = []
+    for tf in ANALYSIS_TFS:
+        r = res.per_tf.get(tf)
+        if not r:
+            continue
+        if r.direction:
+            arrow = "🟢" if r.direction == "call" else "🔴"
+            lines.append(f"{tf}: {arrow} {r.direction.upper()} · {r.strength}%")
+        else:
+            lines.append(f"{tf}: ⏸ sem sinal ({r.strength}%)")
+    por_tf = "\n".join(lines)
+
+    trend_emoji = {"alta": "📈 ALTA", "baixa": "📉 BAIXA"}.get(res.dominant_trend, "➡️ LATERAL")
+
+    if not res.has_signal:
+        # Explica o motivo principal do bloqueio
+        motivos = {r.blocked_by for r in res.per_tf.values() if r.blocked_by}
+        motivo = next(iter(motivos), "confluência insuficiente")
+        return (f"{header}\n\n"
+                f"⏸ *SEM SINAL CONFIRMADO*\n\n"
+                f"Tendência (M15): {trend_emoji}\n"
+                f"{por_tf}\n\n"
+                f"🔎 Motivo: {motivo}\n\n"
+                f"💡 Melhor esperar alinhamento dos 3 tempos.")
+
+    arrow = "🟢 CALL (compra)" if res.aligned_direction == "call" else "🔴 PUT (venda)"
+    dir_key = res.aligned_direction
+    big_tf = max(ANALYSIS_TFS, key=lambda t: {"M1": 1, "M5": 2, "M15": 3}.get(t, 0))
+    expiry = TF_EXPIRY.get(big_tf, 5)
+
+    # Confluencias do timeframe dominante
+    reasons = res.per_tf.get(big_tf, res.per_tf[ANALYSIS_TFS[0]]).reasons
+    conf = "\n".join([f" • {x}" for x in reasons[:6]])
+
+    return (f"{header}\n\n"
+            f"🎯 *{arrow}*\n"
+            f"💪 Força: *{res.aligned_strength}%*\n"
+            f"📊 Tendência (M15): {trend_emoji}\n"
+            f"⏳ Expiração sugerida: *{expiry} min*\n\n"
+            f"{por_tf}\n\n"
+            f"✅ *Confluências:*\n{conf}")
+
+
+async def run_analysis(update, api, active):
+    """Executa a analise e responde no chat (com explicacao da IA se disponivel)."""
+    uid = update.effective_user.id
+    await update.message.reply_text(f"🔍 Analisando *{active}* (M1+M5+M15)...",
+                                    parse_mode="Markdown")
+    try:
+        candles = await asyncio.to_thread(fetch_candles_multi, api, active)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao puxar velas: {e}")
+        return
+    if not any(candles.values()):
+        await update.message.reply_text(
+            f"❌ Não consegui velas de *{active}*.\n"
+            f"Confira o nome em 📈 Operar → 📋 Ativos.", parse_mode="Markdown")
+        return
+    try:
+        res = analyze_multi_timeframe(candles, active)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro na análise: {e}")
+        return
+
+    # Mensagem tecnica (motor)
+    await update.message.reply_text(render_analysis(res), parse_mode="Markdown")
+
+    # Explicacao em linguagem natural (IA opcional)
+    if ai_assistant.is_enabled():
+        per_tf = {k: {"direcao": v.direction, "forca": v.strength,
+                      "tendencia": v.trend, "adx": round(v.adx_value, 1),
+                      "bloqueio": v.blocked_by}
+                  for k, v in res.per_tf.items()}
+        big = res.per_tf.get("M15") or res.per_tf.get(ANALYSIS_TFS[0])
+        reasons = big.reasons if big else []
+        try:
+            texto = await asyncio.to_thread(
+                ai_assistant.explain_analysis,
+                active, per_tf, res.aligned_direction, res.aligned_strength,
+                res.dominant_trend,
+                None if res.has_signal else (big.blocked_by if big else None),
+                reasons,
+            )
+            if texto:
+                await update.message.reply_text(f"🤖 *Análise da IA:*\n\n{texto}",
+                                                parse_mode="Markdown")
+        except Exception as e:
+            log.warning("IA falhou: %s", e)
+
+
+def actives_keyboard():
+    """Teclado com ativos populares em pares + opcao manual."""
+    kb = []
+    row = []
+    for i, a in enumerate(POPULAR_ACTIVES):
+        row.append(KeyboardButton(f"🧠 {a}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([KeyboardButton("⌨️ Digitar Ativo")])
+    kb.append([KeyboardButton("🔙 Voltar")])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+
+# ============================================================
 # HANDLERS
 # ============================================================
 
@@ -842,6 +1031,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [KeyboardButton("📊 Status"), KeyboardButton("🔌 Conectar")],
         [KeyboardButton("📈 Operar"), KeyboardButton("🤖 Auto Trade")],
+        [KeyboardButton("🧠 Analisar Ativo"), KeyboardButton("📋 Lista Sinais")],
         [KeyboardButton("📡 Sinais Ao Vivo"), KeyboardButton("📋 Copytrader")],
         [KeyboardButton("⚙️ Config"), KeyboardButton("👑 Admin")],
     ]
@@ -906,7 +1096,7 @@ async def cmd_auto_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [KeyboardButton("▶️ Iniciar Auto"), KeyboardButton("⏹ Parar Auto")],
         [KeyboardButton("⚙️ Config Auto"), KeyboardButton("📋 Lista Sinais")],
-        [KeyboardButton("🎰 Gerenciamento")],
+        [KeyboardButton("🧠 Analisar Ativo"), KeyboardButton("🎰 Gerenciamento")],
         [KeyboardButton("🔙 Menu")],
     ]
     running = uid in robots_running
@@ -1189,6 +1379,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🤖 Auto Trade":
         await cmd_auto_trade(update, context)
         return
+    if text == "🧠 Analisar Ativo":
+        api = get_exnova(uid)
+        if not api:
+            await update.message.reply_text("❌ Conecte na EXNOVA primeiro!\nUse 🔌 Conectar")
+            return
+        await update.message.reply_text(
+            "🧠 *ANALISAR ATIVO*\n━━━━━━━━━━━━━━━━━━\n\n"
+            "Escolha um ativo pra eu analisar\n"
+            "(M1 + M5 + M15 alinhados):",
+            parse_mode="Markdown",
+            reply_markup=actives_keyboard()
+        )
+        return
+    if text == "⌨️ Digitar Ativo":
+        api = get_exnova(uid)
+        if not api:
+            await update.message.reply_text("❌ Conecte na EXNOVA primeiro!")
+            return
+        user_states[uid] = {"action": "analyze_active"}
+        await update.message.reply_text(
+            "⌨️ Digite o ativo que quer analisar:\n"
+            "Ex: `EURUSD-OTC` ou `BTCUSD-OTC`\n\n"
+            "(sem a palavra OTC também funciona)",
+            parse_mode="Markdown"
+        )
+        return
+    # Clique direto num ativo do teclado: "🧠 EURUSD-OTC"
+    if text.startswith("🧠 ") and len(text) > 3:
+        api = get_exnova(uid)
+        if not api:
+            await update.message.reply_text("❌ Conecte na EXNOVA primeiro!")
+            return
+        _, active = text.split(" ", 1)
+        await run_analysis(update, api, active.strip())
+        return
     if text == "⚙️ Config":
         await cmd_config(update, context)
         return
@@ -1259,6 +1484,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [
             [KeyboardButton("▶️ Iniciar Copy"), KeyboardButton("⏹ Parar Copy")],
             [KeyboardButton("👤 Config Master"), KeyboardButton("👥 Config Follower")],
+            [KeyboardButton("🧠 Analisar Ativo")],
             [KeyboardButton("🔙 Voltar")],
         ]
         reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -1794,29 +2020,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[uid] = {}
         return
 
+    if action == "analyze_active":
+        api = get_exnova(uid)
+        if not api:
+            await update.message.reply_text("❌ Conecte na EXNOVA primeiro!")
+            user_states[uid] = {}
+            return
+        user_states[uid] = {}
+        # Normaliza o nome: aceita "eurusd", "EURUSD", "EURUSD OTC"...
+        active = text.strip().upper().replace(" ", "-")
+        if "-OTC" not in active and active.replace("-", "") not in OP_code_actives():
+            active = f"{active}-OTC"
+        await run_analysis(update, api, active)
+        return
+
     if action == "signal_list":
-        lines = text.strip().split('\n')
-        signals = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(';')
-            if len(parts) >= 3:
-                timeframe = parts[0].strip().upper()
-                active = parts[1].strip().upper()
-                rest = parts[2].strip().split()
-                hora = rest[0].strip()
-                direcao = rest[1].strip().upper() if len(rest) > 1 else "CALL"
-                signals.append({
-                    'timeframe': timeframe,
-                    'active': active,
-                    'time': hora,
-                    'direction': direcao
-                })
+        # Parser FLEXIVEL: aceita varios formatos colados de grupos de sinais
+        signals = parse_signal_list(text)
+
+        # Se nada foi reconhecido e houver IA, tenta extrair com IA
+        if not signals and ai_assistant.is_enabled():
+            ai_sig = await asyncio.to_thread(ai_assistant.parse_free_signal_with_ai, text)
+            if ai_sig:
+                signals = [ai_sig]
+
+        # Ultimo recurso: parser antigo (TIMEFRAME;ATIVO;HORA DIRECAO)
+        if not signals:
+            for line in text.strip().split('\n'):
+                parts = line.strip().split(';')
+                if len(parts) >= 3:
+                    rest = parts[2].strip().split()
+                    signals.append({
+                        'timeframe': parts[0].strip().upper(),
+                        'active': parts[1].strip().upper(),
+                        'time': rest[0].strip(),
+                        'direction': rest[1].strip().upper() if len(rest) > 1 else "CALL",
+                    })
 
         if not signals:
-            await update.message.reply_text("Formato invalido! Use:\n`TIMEFRAME;ATIVO;HORA DIRECAO`", parse_mode="Markdown")
+            await update.message.reply_text(
+                "❌ Não reconheci nenhum sinal.\n\n"
+                "Pode colar em vários formatos:\n"
+                "`M1;EURUSD-OTC;21:11 CALL`\n"
+                "`EURJPY-OTC 21:11 PUT`\n"
+                "`M5 GBPUSD-OTC 21:15 VENDA`\n"
+                "`21:30 BTCUSD COMPRA`",
+                parse_mode="Markdown"
+            )
             return
 
         signal_file = os.path.join(DATA_DIR, f"signals_{uid}.json")
@@ -1852,6 +2102,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[uid] = {}
         return
 
+    # --- Chat por regras: pedido de analise em linguagem natural ---
+    active_pedido = detect_scan_request(text)
+    if active_pedido:
+        api = get_exnova(uid)
+        if api:
+            await run_analysis(update, api, active_pedido)
+            return
+
+    # --- Chat por IA: pergunta livre (so se IA estiver ativa) ---
+    if ai_assistant.is_enabled() and len(text.strip()) > 3:
+        low = text.lower()
+        if not any(k in low for k in ("/", "http", "www.")):
+            try:
+                resp = await asyncio.to_thread(ai_assistant.free_chat, text)
+                if resp:
+                    await update.message.reply_text(f"🤖 {resp}")
+                    return
+            except Exception as e:
+                log.warning("Chat IA falhou: %s", e)
+
     await update.message.reply_text("Use /start")
 
 async def cmd_ativos(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1861,13 +2131,16 @@ async def cmd_ativos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Conecte na EXNOVA primeiro!")
         return
     try:
-        from exnovaapi import OP_code
-        actives = sorted([k for k in OP_code.ACTIVES.keys() if 'OTC' in k])
+        op = _load_op_code()
+        if not op:
+            await update.message.reply_text("Erro: nao consegui carregar a lista de ativos.")
+            return
+        actives = sorted([k for k in op.ACTIVES.keys() if 'OTC' in k])
         lista = "\n".join([f"• {a}" for a in actives[:50]])
         await update.message.reply_text(
             f"📋 Ativos OTC disponiveis na EXNOVA:\n━━━━━━━━━━━━━━━━━━\n{lista}\n\n"
             f"Total: {len(actives)} ativos OTC\n"
-            f"Total geral: {len(OP_code.ACTIVES)}",
+            f"Total geral: {len(op.ACTIVES)}",
             parse_mode=None
         )
     except Exception as e:
